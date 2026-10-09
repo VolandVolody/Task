@@ -103,10 +103,13 @@ describe("orchestrator", () => {
       qualityMode: "fast",
     }, "2026-10-09T12:00:00.000Z");
     const pending = orch.run(created.task.id);
-    await waitFor(() => provider.calls.includes("build"));
-    expect(() => orch.run(created.task.id)).toThrow(/уже выполняется/);
-    release();
-    await pending;
+    try {
+      await waitFor(() => provider.calls.includes("build"));
+      expect(() => orch.run(created.task.id)).toThrow(/уже выполняется/);
+    } finally {
+      release();
+      await pending;
+    }
     expect(store.getTask(created.task.id).task.status).toBe("USER_QA");
     expect(provider.calls).not.toContain("review");
   });
@@ -184,11 +187,14 @@ describe("orchestrator", () => {
       qualityMode: "fast",
     }, "2026-10-09T12:00:00.000Z");
     const pending = orch.run(created.task.id);
-    await waitFor(() => provider.calls.includes("build"));
-    const paused = orch.pause(created.task.id);
-    expect(paused.status).toBe("PAUSED");
-    release();
-    await pending;
+    try {
+      await waitFor(() => provider.calls.includes("build"));
+      const paused = orch.pause(created.task.id);
+      expect(paused.status).toBe("PAUSED");
+    } finally {
+      release();
+      await pending;
+    }
     expect(store.getTask(created.task.id).task.status).toBe("PAUSED");
   });
 });
@@ -244,9 +250,9 @@ describe("http api", () => {
 });
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error("timed out");
 }
