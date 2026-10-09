@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "grokCommand": "grok",
+  "grokModel": "grok-4.7",
+  "baseBranch": "main",
+  "defaultRepoPath": ".",
+  "testCommand": "npm test",
+  "grokTimeoutMs": 900000
+}
