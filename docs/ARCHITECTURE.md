@@ -46,7 +46,9 @@ analyzeFeedback()
 - живые строки `streaming-json` (`text`, `tool_call`, `tool_call_update`, `error`, `end`) превращаются в timeline и raw log. Поле `toolName` в этой сборке бывает `run_terminal_command`, а флаг `--disallowed-tools` ждёт id `run_terminal_cmd`.
 - ответ со схемой на установленном `grok` 1.0.46 лежит в `structuredOutput`. Парсер также принимает `structured_output`. Если поля нет, берётся JSON из `text`.
 
-Независимость ревьюера — это новый процесс без `--resume`, а не другая модель. Пока доступен один Grok. Имена `CodexProvider` / `ChatGPTProvider` / `GLMProvider` в коде не появляются и не имитируются.
+Независимость ревьюера — это новый процесс без `--resume`, а не другая модель. Сейчас зарегистрирован `grok-build`. Оркестратор спрашивает реестр `Map<id, AIProvider>` по роли из `config.aiRouting` (`spec`, `plan`, `builder`, `reviewer`, `feedback`) и не выбирает CLI сам. `codex` и `glm` в реестре не реализованы.
+
+После кодового прохода тот же провайдер делает короткий проход `report` в plan-режиме со схемой. В `done` попадают только шаги из этого отчёта.
 
 Режимы качества отличаются числом проходов одного и того же CLI:
 
@@ -96,6 +98,7 @@ analyzeFeedback()
     review.md
     result.md
     feedback/001.md
+    artifacts.json
     runs/run-001.jsonl  # короткие события прогона
 
 .taskos-local/          # gitignore
@@ -110,7 +113,11 @@ analyzeFeedback()
 
 ## Git
 
-Для `requiresCode` оркестратор создаёт ветку `task/TASK-0001-short-name` от `baseBranch` (по умолчанию `main`).
+Для `requiresCode` оркестратор берёт репозиторий проекта или ручной путь. Своего клона он не подставляет. Ветка `task/TASK-0001-short-name` создаётся от базовой ветки проекта, `origin/HEAD`, `main`, `master` или — с предупреждением — от текущей ветки.
+
+Если локальной ветки нет, а `origin/task/…` есть, выполняется `git checkout --track`. Если remote недоступен и локальной ветки нет, запуск останавливается с `OFFLINE`.
+
+Push ветки и синхронизация `.taskos` — отдельные кнопки. Sync не мержит чужой код, не делает `reset --hard` и не чинит конфликт сам. На `main`/`master` коммит и push метаданных запрещены.
 
 Запрещено продуктом и правилами для Grok:
 
@@ -127,6 +134,8 @@ analyzeFeedback()
 ## Процессы
 
 `ProcessRunner` хранит pid, статус, время, код выхода, stdout/stderr и умеет отменить процесс. Повторный запуск той же задачи блокируется файловым lock в `.taskos-local/locks`. Мёртвый pid считается устаревшим lock и снимается.
+
+Второй процесс сервера на тот же workspace останавливается lock-файлом `.taskos-local/taskos.pid`. Проверка совместимости `grok --version` и `grok --help` выполняется при старте. Сервер всё равно поднимается, чтобы интерфейс показал `GROK_UNAVAILABLE` или `GROK_INCOMPATIBLE`. `/api/health` не делает `git fetch`.
 
 UI получает события по SSE `GET /api/events`. Параллельно пишется raw log.
 
