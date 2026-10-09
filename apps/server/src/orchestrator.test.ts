@@ -34,7 +34,13 @@ function gitRepo(): string {
 function setup(dir: string, provider = new FakeProvider()) {
   const store = new TaskStore(dir);
   store.ensure();
-  store.saveConfig({ ...store.getConfig(), testCommand: "node pass.js", defaultRepoPath: ".", grokCommand: "grok-missing-taskos" });
+  store.saveConfig({
+    ...store.getConfig(),
+    testCommand: "node pass.js",
+    defaultRepoPath: ".",
+    grokCommand: "grok-missing-taskos",
+    aiRouting: { spec: provider.id, plan: provider.id, builder: provider.id, reviewer: provider.id, feedback: provider.id },
+  });
   const orch = new Orchestrator({
     store,
     lock: new TaskLock(path.join(store.localDir, "locks")),
@@ -47,6 +53,17 @@ function setup(dir: string, provider = new FakeProvider()) {
   return { store, orch, provider };
 }
 
+function codeTask(store: TaskStore, dir: string, request: string, quality: "fast" | "verified" | "deep") {
+  return store.createTask({
+    request,
+    scope: "work",
+    requiresCodeMode: "yes",
+    qualityMode: quality,
+    repoPath: dir,
+    testCommands: ["node pass.js"],
+  }, "2026-10-09T12:00:00.000Z");
+}
+
 afterEach(() => {
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -55,12 +72,7 @@ describe("orchestrator", () => {
   it("runs a code task through user QA and keeps the original request", async () => {
     const dir = gitRepo();
     const { store, orch } = setup(dir);
-    const created = store.createTask({
-      request: "сделать импорт нового поставщика",
-      scope: "work",
-      requiresCodeMode: "yes",
-      qualityMode: "verified",
-    }, "2026-10-09T12:00:00.000Z");
+    const created = codeTask(store, dir, "сделать импорт нового поставщика", "verified");
     await orch.run(created.task.id);
     const view = store.getTask(created.task.id);
     expect(view.task.status).toBe("USER_QA");
@@ -96,12 +108,7 @@ describe("orchestrator", () => {
       release = resolve;
     });
     const { store, orch } = setup(dir, provider);
-    const created = store.createTask({
-      request: "долгая задача",
-      scope: "work",
-      requiresCodeMode: "yes",
-      qualityMode: "fast",
-    }, "2026-10-09T12:00:00.000Z");
+    const created = codeTask(store, dir, "долгая задача", "fast");
     const pending = orch.run(created.task.id);
     try {
       await waitFor(() => provider.calls.includes("build"));
@@ -118,12 +125,7 @@ describe("orchestrator", () => {
     const dir = gitRepo();
     fs.writeFileSync(path.join(dir, "dirty.txt"), "x\n");
     const { store, orch } = setup(dir);
-    const created = store.createTask({
-      request: "правка кода",
-      scope: "work",
-      requiresCodeMode: "yes",
-      qualityMode: "fast",
-    }, "2026-10-09T12:00:00.000Z");
+    const created = codeTask(store, dir, "правка кода", "fast");
     await orch.run(created.task.id);
     const view = store.getTask(created.task.id);
     expect(view.task.error?.code).toBe("REPO_DIRTY");
@@ -135,12 +137,7 @@ describe("orchestrator", () => {
     const provider = new FakeProvider();
     provider.reviewPassesOn = 2;
     const { store, orch } = setup(dir, provider);
-    const created = store.createTask({
-      request: "починить парсер",
-      scope: "work",
-      requiresCodeMode: "yes",
-      qualityMode: "deep",
-    }, "2026-10-09T12:00:00.000Z");
+    const created = codeTask(store, dir, "починить парсер", "deep");
     await orch.run(created.task.id);
     const view = store.getTask(created.task.id);
     expect(view.task.status).toBe("USER_QA");
@@ -180,12 +177,7 @@ describe("orchestrator", () => {
       release = resolve;
     });
     const { store, orch } = setup(dir, provider);
-    const created = store.createTask({
-      request: "долгая правка",
-      scope: "work",
-      requiresCodeMode: "yes",
-      qualityMode: "fast",
-    }, "2026-10-09T12:00:00.000Z");
+    const created = codeTask(store, dir, "долгая правка", "fast");
     const pending = orch.run(created.task.id);
     try {
       await waitFor(() => provider.calls.includes("build"));

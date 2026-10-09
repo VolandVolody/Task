@@ -10,7 +10,19 @@ export interface GitSnapshot {
   changedFileNames: string[];
   diffStat: string;
   dirty: boolean;
+  remoteBranch: string | null;
+  upstream: string | null;
+  ahead: number | null;
+  behind: number | null;
 }
+
+export interface GitDiff {
+  text: string;
+  truncated: boolean;
+  files: string[];
+}
+
+const DIFF_CAP = 200 * 1024;
 
 export class GitAdapter {
   async assertRepo(repo: string): Promise<void> {
@@ -43,10 +55,83 @@ export class GitAdapter {
       await this.git(repo, ["checkout", branch]);
       return;
     }
+    const origin = await this.hasOrigin(repo);
+    if (origin) {
+      try {
+        await this.git(repo, ["fetch", "--prune", "origin"]);
+      } catch (error) {
+        throw new AppError(
+          503,
+          "OFFLINE",
+          "Нет связи с remote, а локальной ветки задачи нет. Новую ветку не создаю, чтобы не разойтись с удалённой.",
+          errorText(error),
+        );
+      }
+      if (await this.remoteBranchExists(repo, branch)) {
+        await this.git(repo, ["checkout", "--track", `origin/${branch}`]);
+        return;
+      }
+    }
     await this.git(repo, ["rev-parse", "--verify", "--quiet", base]).catch(() => {
       throw new AppError(409, "BRANCH", `Базовая ветка ${base} не найдена`);
     });
     await this.git(repo, ["checkout", "-b", branch, base]);
+  }
+
+  async detectBase(repo: string): Promise<{ branch: string; warning: string | null }> {
+    await this.assertRepo(repo);
+    try {
+      const ref = (await this.git(repo, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])).trim();
+      const name = ref.replace(/^origin\//, "");
+      if (name && name !== ref) return { branch: name, warning: null };
+    } catch {
+      // origin/HEAD is optional
+    }
+    if (await this.branchExists(repo, "main")) return { branch: "main", warning: null };
+    if (await this.branchExists(repo, "master")) return { branch: "master", warning: null };
+    const current = (await this.git(repo, ["branch", "--show-current"])).trim();
+    return {
+      branch: current || "HEAD",
+      warning: "Базовая ветка не определена. Используется текущая ветка — проверьте, что это не случайная ветка.",
+    };
+  }
+
+  async diff(repo: string, base: string, head = "HEAD"): Promise<GitDiff> {
+    await this.assertRepo(repo);
+    let files: string[] = [];
+    let stat = "";
+    let text = "";
+    try {
+      files = await this.names(repo, ["diff", "--name-only", `${base}...${head}`]);
+      stat = (await this.git(repo, ["diff", "--stat", `${base}...${head}`])).trim();
+      text = await this.git(repo, ["diff", `${base}...${head}`]);
+    } catch {
+      return { text: stat, truncated: false, files };
+    }
+    if (text.length <= DIFF_CAP) return { text: text.trim(), truncated: false, files };
+    const headSlice = text.slice(0, 20_000);
+    return {
+      text: `${stat}\n\n${files.join("\n")}\n\n[diff обрезан, ${text.length} байт]\n${headSlice}`,
+      truncated: true,
+      files,
+    };
+  }
+
+  async pushTaskBranch(repo: string): Promise<string> {
+    await this.assertRepo(repo);
+    const branch = (await this.git(repo, ["branch", "--show-current"])).trim();
+    if (branch === "main" || branch === "master" || !branch.startsWith("task/")) {
+      throw new AppError(409, "BRANCH", "Push разрешён только для ветки задачи task/…");
+    }
+    if (!(await this.hasOrigin(repo))) throw new AppError(409, "GIT", "У репозитория нет origin");
+    const upstream = await this.upstream(repo);
+    if (upstream) await this.git(repo, ["push", "origin", "HEAD"]);
+    else await this.git(repo, ["push", "-u", "origin", "HEAD"]);
+    return branch;
+  }
+
+  async toplevel(repo: string): Promise<string> {
+    return (await this.git(repo, ["rev-parse", "--show-toplevel"])).trim();
   }
 
   async commitAll(repo: string, message: string): Promise<string | null> {
@@ -92,6 +177,9 @@ export class GitAdapter {
     }
     const dirtyNames = await this.names(repo, ["diff", "--name-only"]);
     const names = [...new Set([...changedFileNames, ...dirtyNames])].slice(0, 100);
+    const upstream = await this.upstream(repo);
+    const counts = upstream ? await this.aheadBehind(repo) : null;
+    const remoteBranch = (await this.remoteBranchExists(repo, branch)) ? `origin/${branch}` : null;
     return {
       branch,
       headCommit,
@@ -100,6 +188,10 @@ export class GitAdapter {
       changedFileNames: names,
       diffStat,
       dirty: await this.meaningfulDirty(repo),
+      remoteBranch,
+      upstream,
+      ahead: counts?.ahead ?? null,
+      behind: counts?.behind ?? null,
     };
   }
 
@@ -117,6 +209,44 @@ export class GitAdapter {
   private async meaningfulDirty(repo: string): Promise<boolean> {
     const lines = (await this.git(repo, ["status", "--porcelain"])).split(/\r?\n/).filter(Boolean);
     return lines.some((line) => !isMetadata(line.slice(3).trim()));
+  }
+
+  private async hasOrigin(repo: string): Promise<boolean> {
+    try {
+      const url = (await this.git(repo, ["remote", "get-url", "origin"])).trim();
+      return url.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private async remoteBranchExists(repo: string, branch: string): Promise<boolean> {
+    try {
+      await this.git(repo, ["show-ref", "--verify", "--quiet", `refs/remotes/origin/${branch}`]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async upstream(repo: string): Promise<string | null> {
+    try {
+      const name = (await this.git(repo, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])).trim();
+      return name || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async aheadBehind(repo: string): Promise<{ ahead: number; behind: number } | null> {
+    try {
+      const text = (await this.git(repo, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])).trim();
+      const [ahead, behind] = text.split(/\s+/).map((item) => Number(item));
+      if (!Number.isFinite(ahead) || !Number.isFinite(behind)) return null;
+      return { ahead: ahead ?? 0, behind: behind ?? 0 };
+    } catch {
+      return null;
+    }
   }
 
   private async branchExists(repo: string, branch: string): Promise<boolean> {

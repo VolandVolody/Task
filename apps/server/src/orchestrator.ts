@@ -1,24 +1,30 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AiRunRecord, Task, TaskStatus, TaskStore, TaskView } from "@taskos/core";
+import type { AiRouting, AiRunRecord, Project, Task, TaskStatus, TaskStore, TaskView, TestRun } from "@taskos/core";
 import {
+  applyBuildReport,
   applyFeedbackRestart,
   approveTask,
   branchName,
   completeTask,
-  markPlanDone,
+  parseTestOutput,
+  pathInside,
   pauseTask,
   renderPlanMarkdown,
   renderReviewMarkdown,
   renderSpecMarkdown,
+  resolveBoundRepo,
+  resolveTestCommands,
   resumeTask,
+  reviewCountsFrom,
   transition,
 } from "@taskos/core";
 import type { AIProvider, AiContext, ProviderEvent } from "./ai.js";
+import { ProviderRegistry } from "./ai.js";
 import type { Bus } from "./bus.js";
 import { AppError, abortError, isAbort, publicError } from "./errors.js";
 import type { GitAdapter } from "./git.js";
-import { parseTestOutput } from "@taskos/core";
+import type { GrokProbe } from "./grok-probe.js";
 import type { ProcessRunner } from "./runner.js";
 import { toCard, type TaskCard } from "./present.js";
 import type { TaskLock } from "@taskos/core";
@@ -26,19 +32,26 @@ import type { TaskLock } from "@taskos/core";
 export interface OrchestratorDeps {
   store: TaskStore;
   lock: TaskLock;
-  provider: AIProvider;
+  provider?: AIProvider;
+  registry?: ProviderRegistry;
+  routing?: AiRouting;
   git: GitAdapter;
   runner: ProcessRunner;
   bus: Bus;
   root: string;
   now?: () => string;
+  grokProbe?: GrokProbe | null;
 }
 
 export class Orchestrator {
   private tokens = new Map<string, string>();
   private aborts = new Map<string, AbortController>();
+  private readonly registry: ProviderRegistry;
 
-  constructor(private readonly deps: OrchestratorDeps) {}
+  constructor(private readonly deps: OrchestratorDeps) {
+    this.registry = deps.registry ?? new ProviderRegistry();
+    if (deps.provider && !this.registry.has(deps.provider.id)) this.registry.register(deps.provider);
+  }
 
   run(taskId: string): Promise<void> {
     const acquired = this.deps.lock.tryAcquire(taskId);
@@ -115,6 +128,18 @@ export class Orchestrator {
     return toCard(view, this.deps.store, this.deps.lock.isLocked(view.task.id));
   }
 
+  async push(taskId: string): Promise<TaskCard> {
+    this.assertIdle(taskId);
+    const view = this.deps.store.getTask(taskId);
+    if (!view.task.git.repoPath || !view.task.git.branch?.startsWith("task/")) {
+      throw new AppError(409, "BRANCH", "Push доступен только для ветки задачи");
+    }
+    await this.deps.git.pushTaskBranch(view.task.git.repoPath);
+    await this.refreshGit(this.deps.store.getTask(taskId));
+    this.remember(this.deps.store.getTask(taskId), "Ветка отправлена на origin");
+    return this.card(this.deps.store.getTask(taskId));
+  }
+
   private async execute(taskId: string, signal: AbortSignal): Promise<void> {
     const token = this.tokens.get(taskId);
     try {
@@ -135,6 +160,7 @@ export class Orchestrator {
       throw new AppError(409, "CLOSED", "Задача закрыта");
     }
     if (view.task.status === "PAUSED") throw new AppError(409, "PAUSED", "Сначала снимите паузу");
+    this.assertCompatible();
     this.remember(view, "Запуск обработки");
 
     if (!view.task.specReady) {
@@ -173,9 +199,12 @@ export class Orchestrator {
       this.save(view);
     }
     view = this.enter(this.live(taskId, signal), "USER_QA");
-    view.task.nextAction = view.task.reviewPassed === false
-      ? "Ревью нашло замечания. Проверьте результат"
-      : "Проверить результат";
+    const exhausted = view.task.reviewPassed === false && view.task.qualityMode === "deep" && view.task.fixCycles >= 2;
+    view.task.nextAction = exhausted
+      ? "AI review не пройден после 2 исправлений. Нужна проверка пользователя"
+      : view.task.reviewPassed === false
+        ? "Ревью нашло замечания. Проверьте результат"
+        : "Проверить результат";
     view.task.error = null;
     this.remember(view, "Ожидание проверки пользователя");
   }
@@ -184,7 +213,7 @@ export class Orchestrator {
     const view = this.live(taskId, signal);
     const run = this.openRun(view, "spec");
     try {
-      const spec = await this.deps.provider.generateSpec(this.context(view, "build", signal), (event) => this.onEvent(taskId, run.id, event));
+      const spec = await this.providerFor("spec").generateSpec(await this.context(view, "build", signal), (event) => this.onEvent(taskId, run.id, event));
       const fresh = this.live(taskId, signal);
       this.closeRun(fresh, run.id, "ok", spec.goal);
       if (spec.criticalQuestion) {
@@ -232,7 +261,7 @@ export class Orchestrator {
     const view = this.live(taskId, signal);
     const run = this.openRun(view, "plan");
     try {
-      const steps = await this.deps.provider.generatePlan(this.context(view, "build", signal), (event) => this.onEvent(taskId, run.id, event));
+      const steps = await this.providerFor("plan").generatePlan(await this.context(view, "build", signal), (event) => this.onEvent(taskId, run.id, event));
       const fresh = this.live(taskId, signal);
       fresh.task.plan = steps;
       fresh.task.planReady = true;
@@ -254,7 +283,7 @@ export class Orchestrator {
     if (fixing) {
       const run = this.openRun(view, "feedback");
       try {
-        const analysis = await this.deps.provider.analyzeFeedback(this.context(view, "fix", signal), (event) => this.onEvent(taskId, run.id, event));
+        const analysis = await this.providerFor("feedback").analyzeFeedback(await this.context(view, "fix", signal), (event) => this.onEvent(taskId, run.id, event));
         const fresh = this.live(taskId, signal);
         this.closeRun(fresh, run.id, "ok", analysis.understood);
         this.remember(fresh, `Понял замечание: ${analysis.understood}`);
@@ -266,19 +295,25 @@ export class Orchestrator {
     view = this.live(taskId, signal);
     const run = this.openRun(view, fixing ? "fix" : "builder");
     try {
-      const outcome = await this.deps.provider.executeTask(
-        this.context(this.live(taskId, signal), fixing ? "fix" : "build", signal),
+      const outcome = await this.providerFor(fixing ? "fix" : "builder").executeTask(
+        await this.context(this.live(taskId, signal), fixing ? "fix" : "build", signal),
         (event) => this.onEvent(taskId, run.id, event),
       );
       const fresh = this.live(taskId, signal);
-      fresh.task = markPlanDone(fresh.task, this.now());
-      fresh.task.buildComplete = true;
+      fresh.task = applyBuildReport(fresh.task, outcome.report, this.now());
       fresh.task.error = null;
+      if (outcome.report?.artifacts?.length && fresh.task.git.repoPath) {
+        this.deps.store.registerArtifacts(taskId, fresh.task.git.repoPath, outcome.report.artifacts, this.now());
+      }
+      if (!fresh.task.buildComplete) fresh.task.nextAction = "Часть шагов плана не подтверждена отчётом";
       if (outcome.summary) this.deps.store.writeDoc(taskId, "result.md", outcome.summary.endsWith("\n") ? outcome.summary : `${outcome.summary}\n`);
       this.deps.store.writeDoc(taskId, "plan.md", renderPlanMarkdown(fresh.task.plan));
       this.closeRun(fresh, run.id, "ok", outcome.summary.slice(0, 180), outcome.sessionId);
-      if (fresh.task.requiresCode) await this.commitWork(fresh);
-      this.remember(fresh, "Выполнение закончено");
+      if (fresh.task.requiresCode) {
+        await this.commitWork(fresh);
+        await this.guardWorktree(taskId);
+      }
+      this.remember(this.deps.store.getTask(taskId), fresh.task.buildComplete ? "Выполнение закончено" : "Выполнение закончено не по всем шагам");
     } catch (error) {
       this.closeRun(this.deps.store.getTask(taskId), run.id, signal.aborted ? "cancelled" : "failed", errorText(error));
       throw error;
@@ -294,9 +329,10 @@ export class Orchestrator {
       const run = this.openRun(view, "reviewer");
       let passed = false;
       try {
-        const review = await this.deps.provider.reviewTask(this.context(view, "build", signal), (event) => this.onEvent(taskId, run.id, event));
+        const review = await this.providerFor("reviewer").reviewTask(await this.context(view, "build", signal), (event) => this.onEvent(taskId, run.id, event));
         const fresh = this.live(taskId, signal);
         fresh.task.reviewPassed = review.passed;
+        fresh.task.reviewCounts = reviewCountsFrom(review.findings);
         this.deps.store.writeDoc(taskId, "review.md", renderReviewMarkdown(review));
         this.closeRun(fresh, run.id, "ok", review.summary);
         this.remember(fresh, review.passed ? "Ревью принято" : "Ревью нашло замечания");
@@ -329,58 +365,112 @@ export class Orchestrator {
 
   private async runTests(taskId: string, signal: AbortSignal): Promise<boolean> {
     const view = this.live(taskId, signal);
+    const commands = resolveTestCommands(view.task, this.projectOf(view.task));
+    const repo = view.task.git.repoPath;
+    if (!repo) {
+      throw new AppError(409, "REPO_REQUIRED", "Для тестов нужен репозиторий задачи");
+    }
+    if (commands.length === 0) {
+      view.task.tests = {
+        status: "failed",
+        passed: null,
+        failed: null,
+        command: null,
+        summary: "Команда тестов не задана",
+      };
+      view.task.testRuns = [];
+      view.task.error = { code: "TEST_COMMAND_MISSING", message: "Команда тестов не задана" };
+      view.task.nextAction = "Задайте команду тестов в проекте";
+      this.remember(view, "Команда тестов не задана");
+      return false;
+    }
     const config = this.deps.store.getConfig();
-    const repo = view.task.git.repoPath || this.repoOf(view.task);
-    view.task.tests = { status: "running", passed: null, failed: null, command: config.testCommand, summary: null };
-    this.remember(view, "Тесты запущены");
-    const shell = process.platform === "win32";
-    const result = await this.deps.runner.run(taskId, {
-      command: shell ? process.env.ComSpec || "cmd.exe" : "sh",
-      args: shell ? ["/d", "/s", "/c", config.testCommand] : ["-c", config.testCommand],
-      cwd: repo,
-      timeoutMs: Math.min(config.grokTimeoutMs, 600_000),
-      signal,
-      onLine: (stream, line) => {
-        this.deps.store.appendLog(taskId, "tests", `[${stream}] ${line}`);
-        this.deps.bus.publish({ type: "log", taskId, stream, line });
-      },
-    });
-    if (result.cancelled || signal.aborted) throw abortError();
-    const counts = parseTestOutput(`${result.stdout}\n${result.stderr}`);
-    const passed = result.exitCode === 0 && !result.timedOut && !result.spawnError;
-    const summary = (result.stderr || result.stdout || result.spawnError || "").trim().slice(-1500);
+    const runs: TestRun[] = [];
+    let allPassed = true;
+    for (const command of commands) {
+      const started = this.now();
+      const shell = process.platform === "win32";
+      const result = await this.deps.runner.run(taskId, {
+        command: shell ? process.env.ComSpec || "cmd.exe" : "sh",
+        args: shell ? ["/d", "/s", "/c", command] : ["-c", command],
+        cwd: repo,
+        timeoutMs: Math.min(config.grokTimeoutMs, 600_000),
+        signal,
+        onLine: (stream, line) => {
+          this.deps.store.appendLog(taskId, "tests", `[${stream}] ${line}`);
+          this.deps.bus.publish({ type: "log", taskId, stream, line });
+        },
+      });
+      if (result.cancelled || signal.aborted) throw abortError();
+      const counts = parseTestOutput(`${result.stdout}\n${result.stderr}`);
+      const passed = result.exitCode === 0 && !result.timedOut && !result.spawnError;
+      const summary = (result.stderr || result.stdout || result.spawnError || "").trim().slice(-1500);
+      runs.push({
+        id: `test-${String(runs.length + 1).padStart(2, "0")}`,
+        command,
+        status: passed ? "passed" : "failed",
+        exitCode: result.exitCode,
+        passed: counts.passed,
+        failed: counts.failed,
+        durationMs: Math.max(0, Date.parse(this.now()) - Date.parse(started)),
+        summary: summary || (passed ? "Тесты прошли" : "Тесты не прошли"),
+        startedAt: started,
+        finishedAt: this.now(),
+      });
+      if (!passed) allPassed = false;
+    }
+    const passedCount = runs.reduce((sum, run) => sum + (run.passed ?? 0), 0);
+    const failedCount = runs.reduce((sum, run) => sum + (run.failed ?? 0), 0);
     const fresh = this.live(taskId, signal);
+    fresh.task.testRuns = runs;
     fresh.task.tests = {
-      status: passed ? "passed" : "failed",
-      passed: counts.passed,
-      failed: counts.failed,
-      command: config.testCommand,
-      summary: summary || (passed ? "Тесты прошли" : "Тесты не прошли"),
+      status: allPassed ? "passed" : "failed",
+      passed: runs.some((run) => run.passed !== null) ? passedCount : null,
+      failed: runs.some((run) => run.failed !== null) ? failedCount : null,
+      command: commands.join(" && "),
+      summary: runs.map((run) => `${run.command}: ${run.status} (exit ${run.exitCode ?? "?"})`).join("\n"),
     };
-    if (!passed) {
-      fresh.task.error = { code: result.timedOut ? "AI_TIMEOUT" : "TEST_FAILED", message: "Тесты не прошли", details: summary };
+    if (!allPassed) {
+      fresh.task.error = { code: "TEST_FAILED", message: "Тесты не прошли", details: fresh.task.tests.summary ?? "" };
       fresh.task.nextAction = "Тесты не прошли. Можно отправить замечание.";
     } else {
       fresh.task.error = null;
     }
-    const label = counts.passed !== null ? `${counts.passed} passed${counts.failed ? `, ${counts.failed} failed` : ""}` : passed ? "Тесты прошли" : "Тесты не прошли";
-    this.remember(fresh, label);
-    return passed;
+    this.remember(fresh, allPassed ? "Тесты прошли" : "Тесты не прошли");
+    return allPassed;
   }
 
   private async prepareGit(taskId: string, signal: AbortSignal): Promise<void> {
     const view = this.live(taskId, signal);
-    const config = this.deps.store.getConfig();
-    const repo = this.repoOf(view.task);
+    const project = this.projectOf(view.task);
+    const bound = resolveBoundRepo(view.task, project, this.deps.root);
+    if (!bound.repoPath) {
+      throw new AppError(409, "REPO_REQUIRED", "Для задачи с кодом нужен репозиторий. Укажите его в проекте или вручную — TaskOS не подставляет свой репозиторий.");
+    }
+    let base = view.task.git.baseBranch;
+    let warning: string | null = view.task.git.baseBranchWarning;
+    if (!(view.task.git.baseBranchExplicit && base)) {
+      if (project?.repository?.baseBranch) {
+        base = project.repository.baseBranch;
+        warning = null;
+      } else {
+        const detected = await this.deps.git.detectBase(bound.repoPath);
+        base = detected.branch;
+        warning = detected.warning;
+      }
+    }
     const branch = view.task.git.branch ?? branchName(view.task.id, view.task.title);
-    view.task.git.repoPath = repo;
+    view.task.git.repoPath = bound.repoPath;
+    view.task.git.repoSource = bound.source;
     view.task.git.branch = branch;
-    view.task.git.baseBranch = config.baseBranch;
+    view.task.git.baseBranch = base;
+    view.task.git.baseBranchWarning = warning;
     this.save(view);
-    await this.deps.git.ensureBranch(repo, config.baseBranch, branch);
+    await this.deps.git.ensureBranch(bound.repoPath, base, branch);
     const fresh = this.live(taskId, signal);
     await this.refreshGit(fresh);
-    this.remember(this.live(taskId, signal), `Ветка ${branch}`);
+    const note = warning ? `Ветка ${branch}. ${warning}` : `Ветка ${branch}`;
+    this.remember(this.live(taskId, signal), note);
   }
 
   private async commitWork(view: TaskView): Promise<void> {
@@ -400,24 +490,76 @@ export class Orchestrator {
     this.save(fresh);
   }
 
-  private context(view: TaskView, mode: "build" | "fix", signal: AbortSignal): AiContext {
+  private async context(view: TaskView, mode: "build" | "fix", signal: AbortSignal): Promise<AiContext> {
+    const project = this.projectOf(view.task);
+    let gitDiff = view.task.git.diffStat;
+    if (view.task.requiresCode && view.task.git.repoPath && view.task.git.baseBranch) {
+      try {
+        const loaded = await this.deps.git.diff(view.task.git.repoPath, view.task.git.baseBranch);
+        if (loaded.text) gitDiff = loaded.text;
+      } catch {
+        gitDiff = view.task.git.diffStat;
+      }
+    }
     return {
       task: view.task,
       originalRequest: view.originalRequest,
       spec: this.deps.store.readDoc(view.task.id, "spec.md"),
       plan: this.deps.store.readDoc(view.task.id, "plan.md"),
       review: this.deps.store.readDoc(view.task.id, "review.md"),
+      result: this.deps.store.readDoc(view.task.id, "result.md"),
       feedback: this.deps.store.listFeedback(view.task.id).map((item) => item.body),
       diffStat: view.task.git.diffStat,
-      repoPath: view.task.requiresCode && view.task.git.repoPath ? view.task.git.repoPath : this.repoOf(view.task),
+      gitDiff,
+      changedFiles: view.task.git.changedFileNames,
+      testSummary: view.task.tests.summary,
+      testStatus: view.task.tests.status,
+      testRuns: view.task.testRuns,
+      testCommands: resolveTestCommands(view.task, project),
+      repositoryContext: project?.repository
+        ? `${project.name}: ${project.repository.localPath}`
+        : null,
+      repoPath: view.task.requiresCode && view.task.git.repoPath ? view.task.git.repoPath : this.deps.root,
       mode,
       signal,
     };
   }
 
-  private repoOf(task: Task): string {
-    const config = this.deps.store.getConfig();
-    return path.resolve(this.deps.root, task.git.repoPath || config.defaultRepoPath);
+  private projectOf(task: Task): Project | null {
+    if (!task.projectId) return null;
+    return this.deps.store.listProjects().find((project) => project.id === task.projectId) ?? null;
+  }
+
+  private providerFor(role: "spec" | "plan" | "builder" | "reviewer" | "feedback" | "fix"): AIProvider {
+    const routing = this.deps.routing ?? this.deps.store.getConfig().aiRouting;
+    const key = role === "fix" ? "builder" : role;
+    return this.registry.get(routing[key]);
+  }
+
+  private assertCompatible(): void {
+    const probe = this.deps.grokProbe;
+    if (!probe) return;
+    const routing = this.deps.routing ?? this.deps.store.getConfig().aiRouting;
+    if (!Object.values(routing).includes("grok-build")) return;
+    if (!probe.available) throw new AppError(503, "GROK_UNAVAILABLE", probe.message ?? "Grok Build не найден");
+    if (!probe.compatible) throw new AppError(503, "GROK_INCOMPATIBLE", probe.message ?? "Эта версия Grok Build не подходит TaskOS");
+  }
+
+  private async guardWorktree(taskId: string): Promise<void> {
+    const view = this.deps.store.getTask(taskId);
+    const repo = view.task.git.repoPath;
+    if (!repo) return;
+    try {
+      const top = path.resolve(await this.deps.git.toplevel(repo));
+      if (top !== path.resolve(repo)) this.remember(view, `Корень репозитория не совпал: ${top}`);
+    } catch {
+      return;
+    }
+    const escaped = view.task.git.changedFileNames.filter((name) => !pathInside(repo, name));
+    if (escaped.length === 0) return;
+    const fresh = this.deps.store.getTask(taskId);
+    fresh.task.error = { code: "PATH_ESCAPE", message: "Изменение вышло за каталог репозитория", details: escaped.join("\n") };
+    this.remember(fresh, "Путь вышел за пределы репозитория");
   }
 
   private enter(view: TaskView, status: TaskStatus): TaskView {
@@ -430,11 +572,12 @@ export class Orchestrator {
   }
 
   private openRun(view: TaskView, role: AiRunRecord["role"]): AiRunRecord {
+    const provider = this.providerFor(role);
     const run: AiRunRecord = {
       id: `run-${String(view.task.aiRuns.length + 1).padStart(3, "0")}`,
       role,
-      provider: "grok-build",
-      model: this.deps.store.getConfig().grokModel,
+      provider: provider.id,
+      model: provider.id === "grok-build" ? this.deps.store.getConfig().grokModel : null,
       status: "running",
       startedAt: this.now(),
       finishedAt: null,
@@ -477,8 +620,14 @@ export class Orchestrator {
     const view = this.deps.store.getTask(taskId);
     if (view.task.status === "PAUSED") return;
     const pub = publicError(error);
+    if (pub.code === "REPO_REQUIRED" && view.task.status !== "BLOCKED" && view.task.status !== "CANCELLED" && view.task.status !== "DONE") {
+      view.task = transition(view.task, "BLOCKED", this.now());
+      view.task.blockedReason = pub.message;
+      view.task.nextAction = "Укажите репозиторий проекта";
+    } else {
+      view.task.nextAction = "Можно запустить снова";
+    }
     view.task.error = { code: pub.code, message: pub.message, details: pub.details };
-    view.task.nextAction = "Можно запустить снова";
     this.remember(view, pub.message);
   }
 
@@ -519,12 +668,12 @@ export class Orchestrator {
 }
 
 function runLabel(role: AiRunRecord["role"]): string {
-  if (role === "spec") return "Grok пишет ТЗ";
-  if (role === "plan") return "Grok пишет план";
-  if (role === "builder") return "Grok выполняет задачу";
-  if (role === "fix") return "Grok исправляет замечание";
-  if (role === "reviewer") return "Независимый Grok проверяет результат";
-  return "Grok разбирает замечание";
+  if (role === "spec") return "Модель пишет ТЗ";
+  if (role === "plan") return "Модель пишет план";
+  if (role === "builder") return "Модель выполняет задачу";
+  if (role === "fix") return "Модель исправляет замечание";
+  if (role === "reviewer") return "Независимая проверка результата";
+  return "Модель разбирает замечание";
 }
 
 function errorText(error: unknown): string {
