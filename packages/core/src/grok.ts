@@ -191,7 +191,9 @@ export function buildGrokArgs(input: {
     "run_terminal_cmd",
     "--no-subagents",
     "--rules",
-    "Отвечай по-русски. Верни только объект по схеме. Не изменяй файлы.",
+    input.role === "report"
+      ? "Верни только объект по схеме. Не вызывай инструменты. Копируй id шагов из промпта. status только done, pending, failed или skipped."
+      : "Отвечай по-русски. Верни только объект по схеме. Не изменяй файлы.",
   );
   return args;
 }
@@ -432,6 +434,70 @@ export function coerceFeedback(value: unknown): FeedbackAnalysis {
     changes: stringList(record.changes),
     requiresCode: record.requiresCode === true,
   };
+}
+
+function isBuildReportShape(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) && Array.isArray((value as Record<string, unknown>).steps);
+}
+
+export function extractBuildReport(stdout: string): BuildReport | null {
+  const final = parseGrokFinal(stdout);
+  const fromSchema = coerceIfReport(final.data);
+  if (fromSchema) return fromSchema;
+  const candidates: unknown[] = [];
+  for (const source of [final.text, stdout]) {
+    if (!source) continue;
+    for (let index = 0; index < source.length; index += 1) {
+      if (source[index] !== "{") continue;
+      const slice = balancedObject(source, index);
+      if (!slice) continue;
+      try {
+        candidates.push(JSON.parse(slice));
+      } catch {
+        // keep scanning
+      }
+      if (slice.length > 2) index += slice.length - 1;
+    }
+  }
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    const report = coerceIfReport(candidates[index]);
+    if (report) return report;
+  }
+  return null;
+}
+
+function coerceIfReport(value: unknown): BuildReport | null {
+  if (!isBuildReportShape(value)) return null;
+  try {
+    return coerceBuildReport(value);
+  } catch {
+    return null;
+  }
+}
+
+function balancedObject(text: string, start: number): string | null {
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escape) escape = false;
+      else if (char === "\\") escape = true;
+      else if (char === "\"") inString = false;
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, index + 1);
+    }
+  }
+  return null;
 }
 
 export function coerceBuildReport(value: unknown): BuildReport {

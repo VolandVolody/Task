@@ -4,6 +4,7 @@ import {
   coercePlan,
   coerceReview,
   coerceSpec,
+  extractBuildReport,
   parseGrokFinal,
   parseGrokStreamLine,
   renderSpecMarkdown,
@@ -118,6 +119,15 @@ describe("grok parsing", () => {
     expect(() => coerceSpec({ title: "x" })).toThrow(/разобрать|цели/i);
   });
 
+  it("asks the report pass to copy step ids and not call tools", () => {
+    const args = buildGrokArgs({ role: "report", promptFile: "p.md", cwd: "C:\\repo", model: "grok-4.7" });
+    expect(args).toContain("plan");
+    expect(args).toContain("--json-schema");
+    const rules = args[args.indexOf("--rules") + 1] ?? "";
+    expect(rules).toMatch(/Не вызывай инструменты/);
+    expect(rules).toMatch(/Копируй id/);
+  });
+
   it("reads structuredOutput from the installed grok json format", () => {
     const stdout = [
       "{",
@@ -130,6 +140,53 @@ describe("grok parsing", () => {
     const final = parseGrokFinal(stdout);
     expect(final.sessionId).toBe("abc");
     expect(coerceSpec(final.data).goal).toBe("Цель");
+  });
+
+  it("extracts the last build report when structured output is null", () => {
+    const draft = JSON.stringify({
+      summary: "черновик",
+      steps: [{ id: "read-readme", status: "in_progress", note: "смотрю" }],
+    });
+    const latest = JSON.stringify({
+      summary: "строка добавлена",
+      steps: [
+        { id: "01", status: "done", note: "готово" },
+        { id: "append-line", status: "in_progress", note: "выдумал" },
+      ],
+    });
+    const stdout = JSON.stringify({
+      text: draft + latest,
+      stopReason: "end_turn",
+      sessionId: "rep",
+      structuredOutput: null,
+      structuredOutputError: "model did not produce structured output",
+      usage: { tokens: 3 },
+    });
+    const report = extractBuildReport(stdout);
+    expect(report?.summary).toBe("строка добавлена");
+    expect(report?.steps.map((step) => [step.id, step.status])).toEqual([
+      ["01", "done"],
+      ["append-line", "pending"],
+    ]);
+  });
+
+  it("prefers a schema report over a draft inside text", () => {
+    const stdout = JSON.stringify({
+      text: JSON.stringify({ summary: "черновик", steps: [{ id: "99", status: "done" }] }),
+      structuredOutput: { summary: "по схеме", steps: [{ id: "01", status: "done", note: "" }] },
+    });
+    const report = extractBuildReport(stdout);
+    expect(report?.summary).toBe("по схеме");
+    expect(report?.steps[0]?.id).toBe("01");
+  });
+
+  it("returns null when the output has no steps array", () => {
+    const stdout = JSON.stringify({
+      text: "я не смог составить отчёт",
+      structuredOutput: null,
+      usage: { tokens: 3 },
+    });
+    expect(extractBuildReport(stdout)).toBeNull();
   });
 
   it("surfaces a grok error object", () => {

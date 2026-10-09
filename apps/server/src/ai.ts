@@ -14,7 +14,7 @@ import type {
 import {
   blockedCommandReason,
   buildGrokArgs,
-  coerceBuildReport,
+  extractBuildReport,
   coerceCompose,
   coerceFeedback,
   coercePlan,
@@ -157,8 +157,36 @@ export class GrokBuildProvider implements AIProvider {
     if (streamError || result.exitCode !== 0) {
       throw new AppError(502, "GROK_FAILED", "Grok завершился с ошибкой", streamError || tail(result.stderr) || tail(result.stdout));
     }
-    const report = await this.structured(ctx, "report", reportPrompt(ctx, text), coerceBuildReport, onEvent);
+    const report = await this.report(ctx, text, onEvent);
     return { ok: true, summary: report.summary || text.trim() || "Проход Grok завершён.", sessionId, report };
+  }
+
+  private async report(ctx: AiContext, transcript: string, onEvent?: Listen): Promise<BuildReport> {
+    const file = this.store.promptFile(ctx.task.id, "report");
+    const prompt = reportPrompt(ctx, transcript);
+    fs.writeFileSync(file, prompt, "utf8");
+    const config = this.store.getConfig();
+    const command = await this.command(config.grokCommand);
+    const result = await this.runner.run(ctx.task.id, {
+      command,
+      args: buildGrokArgs({ role: "report", promptFile: file, cwd: ctx.repoPath, model: config.grokModel }),
+      cwd: ctx.repoPath,
+      timeoutMs: config.grokTimeoutMs,
+      signal: ctx.signal,
+      onLine: (stream, line) => onEvent?.({ type: "log", stream, line }),
+    });
+    if (result.cancelled) throw abortError();
+    if (result.timedOut) throw new AppError(504, "AI_TIMEOUT", "Grok не ответил вовремя", tail(result.stderr));
+    if (result.spawnError) throw new AppError(503, "GROK_UNAVAILABLE", "Grok Build не запустился", result.spawnError);
+    const parsed = extractBuildReport(`${result.stdout}\n${result.stderr}`);
+    if (parsed) return parsed;
+    if (result.exitCode !== 0) {
+      throw new AppError(502, "GROK_FAILED", "Grok завершился с ошибкой", tail(result.stderr) || tail(result.stdout));
+    }
+    return {
+      summary: "Отчёт сборки не разобран. Шаги плана не отмечены выполненными.",
+      steps: [],
+    };
   }
 
   private async structured<T>(
@@ -331,17 +359,17 @@ export function buildPrompt(ctx: AiContext): string {
 }
 
 function reportPrompt(ctx: AiContext, transcript: string): string {
-  const ids = ctx.task.plan.map((step) => step.id).join(", ") || "нет шагов";
+  const ids = ctx.task.plan.map((step) => `${step.id}: ${step.title}`).join("\n") || "шагов нет";
   return [
-    "Составь отчёт о выполнении. Отметь done только те шаги, которые реально сделаны.",
-    "Не помечай шаг done, если он не выполнен.",
-    `Идентификаторы шагов: ${ids}`,
+    "Верни только JSON отчёта. Не вызывай инструменты и не проверяй файлы заново.",
+    "Поле steps содержит только id из списка ниже. Не выдумывай новые id.",
+    "status: done, pending, failed или skipped. done — только если ход выполнения это подтверждает.",
     "",
-    "PLAN",
-    ctx.plan ?? "",
+    "STEPS",
+    ids,
     "",
     "Ход выполнения:",
-    tail(transcript),
+    tail(transcript) || "Кодовый проход завершился без текстового отчёта.",
   ].join("\n");
 }
 
