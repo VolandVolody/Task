@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyBuildReport,
   applyFeedbackRestart,
   approveTask,
   branchName,
@@ -7,6 +8,8 @@ import {
   computeProgress,
   createTask,
   estimateEta,
+  etaRangeForStages,
+  getAvailableActions,
   isSecretPath,
   nextId,
   parseTestOutput,
@@ -97,6 +100,42 @@ describe("progress", () => {
   });
 });
 
+describe("actions and build reports", () => {
+  it("gates ready, qa, and done", () => {
+    const ready = getAvailableActions(task({ status: "READY", userApproved: true }), false);
+    expect(ready.canRun).toBe(false);
+    expect(ready.canReview).toBe(false);
+    expect(ready.canComplete).toBe(true);
+    expect(ready.canFeedback).toBe(true);
+
+    const qa = getAvailableActions(task({ status: "USER_QA" }), false);
+    expect(qa.canApprove).toBe(true);
+    expect(qa.canFeedback).toBe(true);
+    expect(qa.canReview).toBe(false);
+    expect(qa.canRun).toBe(false);
+
+    const done = getAvailableActions(task({ status: "DONE", userApproved: true }), false);
+    expect(Object.values(done).every((value) => value === false)).toBe(true);
+  });
+
+  it("marks only the steps named in the build report", () => {
+    const item = task({ plan: [step("01", "pending"), step("02", "pending"), step("03", "skipped")] });
+    const partial = applyBuildReport(item, { summary: "часть", steps: [{ id: "01", status: "done", note: "ок" }] }, NOW);
+    expect(partial.plan.map((itemStep) => itemStep.status)).toEqual(["done", "pending", "skipped"]);
+    expect(partial.buildComplete).toBe(false);
+    const full = applyBuildReport(item, {
+      summary: "всё",
+      steps: [
+        { id: "01", status: "done", note: "" },
+        { id: "02", status: "done", note: "" },
+      ],
+    }, NOW);
+    expect(full.buildComplete).toBe(true);
+    expect(applyBuildReport(task({ plan: [] }), { summary: "пусто", steps: [] }, NOW).buildComplete).toBe(true);
+    expect(applyBuildReport(item, null, NOW).buildComplete).toBe(false);
+  });
+});
+
 describe("eta and secrets", () => {
   it("says the estimate is rough without history", () => {
     const estimate = estimateEta(task(), []);
@@ -122,6 +161,17 @@ describe("eta and secrets", () => {
   it("waits on the user during QA", () => {
     const item = task({ status: "USER_QA", userApproved: false });
     expect(estimateEta(item, []).label).toBe("Ждёт вашей проверки");
+  });
+
+  it("adds fallback ranges per stage", () => {
+    expect(etaRangeForStages(["SPEC", "PLAN"], [])).toEqual({ min: 4, max: 12, uncertain: true });
+  });
+
+  it("does not fold the running minimum into the next stage maximum", () => {
+    const history: StageDuration[] = ["SPEC", "PLAN"].flatMap((stage) =>
+      [1, 2, 3].map(() => ({ stage, startedAt: NOW, finishedAt: LATER, durationMs: 5 * 60_000 })),
+    );
+    expect(etaRangeForStages(["SPEC", "PLAN"], history)).toEqual({ min: 8, max: 14, uncertain: false });
   });
 
   it("flags secret-looking paths and parses test counts", () => {

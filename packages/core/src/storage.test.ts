@@ -1,8 +1,11 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { InstanceLock } from "./instance-lock.js";
 import { TaskLock } from "./lock.js";
+import { blockedCommandReason } from "./policy.js";
 import { TaskStore } from "./storage.js";
 
 const dirs: string[] = [];
@@ -45,6 +48,62 @@ describe("storage", () => {
     expect(store.listFeedback(created.task.id)[0]?.body).toBe("цена считается неправильно");
     expect(fs.readFileSync(requestPath, "utf8")).toBe(before);
   });
+
+  it("reads a stage1 task and an arbitrary provider id", () => {
+    const root = tempRoot();
+    const store = new TaskStore(root);
+    store.ensure();
+    const dir = path.join(store.dataDir, "tasks", "TASK-0007");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "request.md"), "старый запрос\n", "utf8");
+    fs.writeFileSync(path.join(dir, "task.json"), JSON.stringify({
+      schemaVersion: 1,
+      id: "TASK-0007",
+      title: "Старая",
+      scope: "work",
+      projectId: null,
+      projectMode: "auto",
+      type: "other",
+      typeSetByUser: false,
+      status: "INBOX",
+      statusBeforePause: null,
+      createdAt: "2026-10-01T00:00:00.000Z",
+      updatedAt: "2026-10-01T00:00:00.000Z",
+      stageStartedAt: null,
+      requiresCodeMode: "auto",
+      requiresCode: false,
+      qualityMode: "verified",
+      aiProvider: "some-future-provider",
+      progress: 0,
+      git: { repoPath: null, branch: null, baseBranch: "main", headCommit: null, commitsCount: 0, changedFiles: 0, changedFileNames: [], diffStat: "", dirty: false, prUrl: null, prState: null },
+      currentStage: "INBOX",
+      nextAction: null,
+      goal: null,
+      blockedReason: null,
+      specReady: false,
+      planReady: false,
+      buildComplete: false,
+      reviewPassed: null,
+      reviewSkipped: false,
+      tests: { status: "pending", passed: null, failed: null, command: null, summary: null },
+      userApproved: false,
+      fixCycles: 0,
+      aiLabel: "Grok ×2 review",
+      aiRuns: [],
+      timeline: [],
+      stageDurations: [],
+      assumptions: [],
+      error: null,
+      plan: [],
+    }), "utf8");
+    const loaded = store.getTask("TASK-0007");
+    expect(loaded.originalRequest).toBe("старый запрос");
+    expect(loaded.task.aiProvider).toBe("some-future-provider");
+    expect(loaded.task.git.repoSource).toBe("none");
+    expect(loaded.task.git.baseBranch).toBe("main");
+    expect(loaded.task.testRuns).toEqual([]);
+    expect(store.getConfig().aiRouting.builder).toBe("grok-build");
+  });
 });
 
 describe("locking", () => {
@@ -65,5 +124,30 @@ describe("locking", () => {
     );
     const taken = lock.tryAcquire("TASK-0002");
     expect(taken.ok).toBe(true);
+  });
+
+  it("refuses a second live workspace lock", () => {
+    const file = path.join(tempRoot(), ".taskos-local", "taskos.pid");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, `${child.pid}\n`, "utf8");
+      expect(() => new InstanceLock(file).acquire()).toThrow(/уже запущен/);
+    } finally {
+      child.kill();
+    }
+    fs.writeFileSync(file, "2147000000\n", "utf8");
+    const again = new InstanceLock(file);
+    again.acquire();
+    again.release();
+  });
+});
+
+describe("command policy", () => {
+  it("blocks obvious destructive commands and allows a normal test", () => {
+    expect(blockedCommandReason("rm -rf /")).toMatch(/Заблокировано/);
+    expect(blockedCommandReason("Remove-Item -Recurse C:\\")).toMatch(/Заблокировано/);
+    expect(blockedCommandReason("shutdown /s")).toMatch(/Заблокировано/);
+    expect(blockedCommandReason("npm test")).toBeNull();
   });
 });

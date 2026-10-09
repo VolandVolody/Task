@@ -1,18 +1,31 @@
 import fs from "node:fs";
 import path from "node:path";
 import type {
+  AiRouting,
+  BuildArtifactRef,
   CreateTaskInput,
   FeedbackItem,
   Project,
+  ProjectRepository,
   ProjectStage,
   Task,
+  TaskArtifact,
   TaskView,
   TaskosConfig,
+  TestRun,
 } from "./types.js";
 import { WorkflowError } from "./types.js";
 import { computeProgress, createTask } from "./workflow.js";
 
 export type DocName = "spec.md" | "plan.md" | "review.md" | "result.md";
+
+export const DEFAULT_ROUTING: AiRouting = {
+  spec: "grok-build",
+  plan: "grok-build",
+  builder: "grok-build",
+  reviewer: "grok-build",
+  feedback: "grok-build",
+};
 
 export const DEFAULT_CONFIG: TaskosConfig = {
   version: 1,
@@ -22,6 +35,7 @@ export const DEFAULT_CONFIG: TaskosConfig = {
   defaultRepoPath: ".",
   testCommand: "npm test",
   grokTimeoutMs: 900000,
+  aiRouting: DEFAULT_ROUTING,
 };
 
 export class TaskStore {
@@ -52,7 +66,12 @@ export class TaskStore {
     this.ensure();
     try {
       const parsed = JSON.parse(fs.readFileSync(this.configPath(), "utf8")) as Partial<TaskosConfig>;
-      return { ...DEFAULT_CONFIG, ...parsed, version: 1 };
+      return {
+        ...DEFAULT_CONFIG,
+        ...parsed,
+        version: 1,
+        aiRouting: { ...DEFAULT_ROUTING, ...(parsed.aiRouting ?? {}) },
+      };
     } catch {
       return { ...DEFAULT_CONFIG };
     }
@@ -168,7 +187,13 @@ export class TaskStore {
       .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
   }
 
-  createProject(input: Omit<Project, "schemaVersion" | "id" | "createdAt" | "updatedAt"> & { id?: string }, now: string): Project {
+  createProject(
+    input: Omit<Project, "schemaVersion" | "id" | "createdAt" | "updatedAt" | "repository"> & {
+      id?: string;
+      repository?: ProjectRepository | null;
+    },
+    now: string,
+  ): Project {
     this.ensure();
     const ids = this.listProjects().map((project) => project.id);
     const project: Project = {
@@ -181,6 +206,7 @@ export class TaskStore {
       nextAction: input.nextAction.trim(),
       definitionOfDone: input.definitionOfDone.trim(),
       stages: input.stages,
+      repository: input.repository ?? null,
       createdAt: now,
       updatedAt: now,
     };
@@ -227,6 +253,59 @@ export class TaskStore {
     if (!latest) return "";
     const lines = fs.readFileSync(path.join(dir, latest), "utf8").split(/\r?\n/);
     return lines.slice(-maxLines).join("\n").trim();
+  }
+
+  listArtifacts(id: string): TaskArtifact[] {
+    assertId(id, "TASK");
+    const file = path.join(this.taskDir(id), "artifacts.json");
+    if (!fs.existsSync(file)) return [];
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { artifacts?: TaskArtifact[] };
+      return Array.isArray(parsed.artifacts) ? parsed.artifacts.map(normalizeArtifact) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  saveArtifacts(id: string, artifacts: TaskArtifact[]): void {
+    assertId(id, "TASK");
+    writeJson(path.join(this.taskDir(id), "artifacts.json"), { artifacts });
+  }
+
+  registerArtifacts(id: string, repo: string, refs: BuildArtifactRef[], now: string, source: TaskArtifact["source"] = "ai"): TaskArtifact[] {
+    const current = this.listArtifacts(id);
+    const next = current.slice();
+    for (const ref of refs) {
+      const rel = ref.path.replace(/\\/g, "/").replace(/^\.\//, "");
+      if (!rel || rel.split("/").includes("..")) continue;
+      const abs = path.resolve(repo, rel);
+      const root = path.resolve(repo);
+      const relative = path.relative(root, abs);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) continue;
+      let size: number | null = null;
+      try {
+        if (fs.existsSync(abs) && fs.statSync(abs).isFile()) size = fs.statSync(abs).size;
+      } catch {
+        size = null;
+      }
+      const existing = next.find((item) => item.path === relative.replace(/\\/g, "/"));
+      if (existing) {
+        existing.sizeBytes = size;
+        existing.name = ref.label || existing.name;
+        continue;
+      }
+      next.push({
+        id: `art-${String(next.length + 1).padStart(3, "0")}`,
+        name: ref.label || path.basename(rel),
+        path: relative.replace(/\\/g, "/"),
+        kind: "file",
+        sizeBytes: size,
+        createdAt: now,
+        source,
+      });
+    }
+    this.saveArtifacts(id, next);
+    return next;
   }
 
   promptFile(taskId: string, role: string): string {
@@ -288,19 +367,32 @@ function normalizeTask(raw: Partial<Task>): Task {
     ...base,
     plan: Array.isArray(base.plan) ? base.plan : [],
     timeline: Array.isArray(base.timeline) ? base.timeline : [],
-    aiRuns: Array.isArray(base.aiRuns) ? base.aiRuns : [],
     stageDurations: Array.isArray(base.stageDurations) ? base.stageDurations : [],
     assumptions: Array.isArray(base.assumptions) ? base.assumptions : [],
     goal: typeof base.goal === "string" ? base.goal : null,
+    aiProvider: typeof base.aiProvider === "string" && base.aiProvider ? base.aiProvider : "grok-build",
+    testRuns: Array.isArray(base.testRuns) ? base.testRuns.map(normalizeTestRun) : [],
+    testCommands: Array.isArray(base.testCommands) ? base.testCommands.filter((item): item is string => typeof item === "string") : null,
+    reviewCounts: normalizeCounts(base.reviewCounts),
+    aiRuns: Array.isArray(base.aiRuns) ? base.aiRuns.map(normalizeRun) : [],
     git: normalizeGit(base.git),
   };
 }
 
 function normalizeGit(git: Partial<Task["git"]> | undefined): Task["git"] {
+  const repoPath = git?.repoPath ?? null;
+  const source = git?.repoSource === "project" || git?.repoSource === "manual" || git?.repoSource === "none"
+    ? git.repoSource
+    : repoPath
+      ? "manual"
+      : "none";
   return {
-    repoPath: git?.repoPath ?? null,
+    repoPath,
+    repoSource: source,
     branch: git?.branch ?? null,
-    baseBranch: git?.baseBranch || "main",
+    baseBranch: git?.baseBranch ?? "",
+    baseBranchExplicit: git?.baseBranchExplicit === true,
+    baseBranchWarning: git?.baseBranchWarning ?? null,
     headCommit: git?.headCommit ?? null,
     commitsCount: git?.commitsCount ?? 0,
     changedFiles: git?.changedFiles ?? 0,
@@ -309,6 +401,54 @@ function normalizeGit(git: Partial<Task["git"]> | undefined): Task["git"] {
     dirty: git?.dirty === true,
     prUrl: git?.prUrl ?? null,
     prState: git?.prState ?? null,
+    remoteBranch: git?.remoteBranch ?? null,
+    upstream: git?.upstream ?? null,
+    ahead: typeof git?.ahead === "number" ? git.ahead : null,
+    behind: typeof git?.behind === "number" ? git.behind : null,
+  };
+}
+
+function normalizeRun(raw: Task["aiRuns"][number]): Task["aiRuns"][number] {
+  return {
+    ...raw,
+    provider: typeof raw.provider === "string" && raw.provider ? raw.provider : "grok-build",
+    model: typeof raw.model === "string" ? raw.model : null,
+  };
+}
+
+function normalizeTestRun(raw: TestRun): TestRun {
+  return {
+    id: raw.id,
+    command: raw.command,
+    status: raw.status === "passed" ? "passed" : "failed",
+    exitCode: typeof raw.exitCode === "number" ? raw.exitCode : null,
+    passed: typeof raw.passed === "number" ? raw.passed : null,
+    failed: typeof raw.failed === "number" ? raw.failed : null,
+    durationMs: typeof raw.durationMs === "number" ? raw.durationMs : null,
+    summary: raw.summary ?? "",
+    startedAt: raw.startedAt ?? "",
+    finishedAt: raw.finishedAt ?? "",
+  };
+}
+
+function normalizeCounts(raw: Task["reviewCounts"]): Task["reviewCounts"] {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    high: Number(raw.high) || 0,
+    medium: Number(raw.medium) || 0,
+    low: Number(raw.low) || 0,
+  };
+}
+
+function normalizeArtifact(raw: TaskArtifact): TaskArtifact {
+  return {
+    id: raw.id || "art-000",
+    name: raw.name || raw.path || "файл",
+    path: raw.path || "",
+    kind: raw.kind === "document" || raw.kind === "other" ? raw.kind : "file",
+    sizeBytes: typeof raw.sizeBytes === "number" ? raw.sizeBytes : null,
+    createdAt: raw.createdAt || "",
+    source: raw.source === "taskos" || raw.source === "user" ? raw.source : "ai",
   };
 }
 
@@ -324,8 +464,24 @@ function normalizeProject(raw: Partial<Project>): Project {
     nextAction: raw.nextAction ?? "",
     definitionOfDone: raw.definitionOfDone ?? "",
     stages: Array.isArray(raw.stages) ? raw.stages.map(normalizeStage) : [],
+    repository: normalizeRepository(raw.repository),
     createdAt: raw.createdAt ?? "",
     updatedAt: raw.updatedAt ?? "",
+  };
+}
+
+function normalizeRepository(raw: Project["repository"] | undefined): ProjectRepository | null {
+  if (!raw || typeof raw !== "object") return null;
+  const localPath = typeof raw.localPath === "string" ? raw.localPath.trim() : "";
+  if (!localPath) return null;
+  const commands = Array.isArray(raw.testCommands) ? raw.testCommands.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
+  const legacy = typeof raw.testCommand === "string" && raw.testCommand.trim() ? raw.testCommand.trim() : null;
+  return {
+    localPath,
+    remoteUrl: typeof raw.remoteUrl === "string" && raw.remoteUrl.trim() ? raw.remoteUrl.trim() : null,
+    baseBranch: typeof raw.baseBranch === "string" && raw.baseBranch.trim() ? raw.baseBranch.trim() : null,
+    testCommand: legacy,
+    testCommands: commands.length > 0 ? commands : legacy ? [legacy] : [],
   };
 }
 

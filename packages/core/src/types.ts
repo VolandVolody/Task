@@ -64,11 +64,32 @@ export interface TestState {
   summary: string | null;
 }
 
+export interface TestRun {
+  id: string;
+  command: string;
+  status: "passed" | "failed";
+  exitCode: number | null;
+  passed: number | null;
+  failed: number | null;
+  durationMs: number | null;
+  summary: string;
+  startedAt: string;
+  finishedAt: string;
+}
+
+export interface ReviewCounts {
+  high: number;
+  medium: number;
+  low: number;
+}
+
+export type AiRole = "spec" | "plan" | "builder" | "reviewer" | "fix" | "feedback" | "report";
+
 export interface AiRunRecord {
   id: string;
   role: "spec" | "plan" | "builder" | "reviewer" | "fix" | "feedback";
-  provider: "grok-build";
-  model: string;
+  provider: string;
+  model: string | null;
   status: "running" | "ok" | "failed" | "cancelled";
   startedAt: string;
   finishedAt: string | null;
@@ -76,10 +97,15 @@ export interface AiRunRecord {
   summary: string | null;
 }
 
+export type RepoSource = "project" | "manual" | "none";
+
 export interface GitState {
   repoPath: string | null;
+  repoSource: RepoSource;
   branch: string | null;
   baseBranch: string;
+  baseBranchExplicit: boolean;
+  baseBranchWarning: string | null;
   headCommit: string | null;
   commitsCount: number;
   changedFiles: number;
@@ -88,6 +114,10 @@ export interface GitState {
   dirty: boolean;
   prUrl: string | null;
   prState: string | null;
+  remoteBranch: string | null;
+  upstream: string | null;
+  ahead: number | null;
+  behind: number | null;
 }
 
 export interface TaskError {
@@ -113,7 +143,7 @@ export interface Task {
   requiresCodeMode: RequiresCodeMode;
   requiresCode: boolean;
   qualityMode: QualityMode;
-  aiProvider: "grok-build";
+  aiProvider: string;
   progress: number;
   git: GitState;
   currentStage: string;
@@ -126,6 +156,9 @@ export interface Task {
   reviewPassed: boolean | null;
   reviewSkipped: boolean;
   tests: TestState;
+  testRuns: TestRun[];
+  testCommands: string[] | null;
+  reviewCounts: ReviewCounts | null;
   userApproved: boolean;
   fixCycles: number;
   aiLabel: string;
@@ -148,6 +181,14 @@ export interface ProjectStage {
   status: "todo" | "doing" | "done";
 }
 
+export interface ProjectRepository {
+  localPath: string;
+  remoteUrl: string | null;
+  baseBranch: string | null;
+  testCommand: string | null;
+  testCommands: string[];
+}
+
 export interface Project {
   schemaVersion: 1;
   id: string;
@@ -158,8 +199,17 @@ export interface Project {
   nextAction: string;
   definitionOfDone: string;
   stages: ProjectStage[];
+  repository: ProjectRepository | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface AiRouting {
+  spec: string;
+  plan: string;
+  builder: string;
+  reviewer: string;
+  feedback: string;
 }
 
 export interface TaskosConfig {
@@ -170,6 +220,7 @@ export interface TaskosConfig {
   defaultRepoPath: string;
   testCommand: string;
   grokTimeoutMs: number;
+  aiRouting: AiRouting;
 }
 
 export interface CreateTaskInput {
@@ -182,6 +233,7 @@ export interface CreateTaskInput {
   requiresCodeMode?: RequiresCodeMode;
   repoPath?: string | null;
   baseBranch?: string;
+  testCommands?: string[] | null;
 }
 
 export interface FeedbackItem {
@@ -226,6 +278,50 @@ export interface EtaEstimate {
   minMinutes: number | null;
   maxMinutes: number | null;
 }
+
+export interface BuildReportStep {
+  id: string;
+  status: "done" | "pending" | "failed" | "skipped";
+  note: string;
+}
+
+export interface BuildArtifactRef {
+  path: string;
+  label: string;
+}
+
+export interface BuildReport {
+  summary: string;
+  steps: BuildReportStep[];
+  artifacts?: BuildArtifactRef[];
+}
+
+export type ArtifactKind = "file" | "document" | "other";
+export type ArtifactSource = "ai" | "taskos" | "user";
+
+export interface TaskArtifact {
+  id: string;
+  name: string;
+  path: string;
+  kind: ArtifactKind;
+  sizeBytes: number | null;
+  createdAt: string;
+  source: ArtifactSource;
+}
+
+export interface TaskActions {
+  canRun: boolean;
+  canReview: boolean;
+  canPause: boolean;
+  canResume: boolean;
+  canApprove: boolean;
+  canComplete: boolean;
+  canFeedback: boolean;
+  canCancel: boolean;
+  canPush: boolean;
+}
+
+export type InactivityLevel = "ok" | "stale" | "cold";
 
 export class WorkflowError extends Error {
   constructor(message: string) {

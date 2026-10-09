@@ -1,10 +1,17 @@
+import path from "node:path";
 import type {
+  BuildReport,
   CreateTaskInput,
   EtaEstimate,
+  InactivityLevel,
   PlanStep,
+  Project,
   QualityMode,
+  RepoSource,
+  ReviewCounts,
   StageDuration,
   Task,
+  TaskActions,
   TaskStatus,
   TaskType,
 } from "./types.js";
@@ -97,11 +104,14 @@ function emptyTests(): Task["tests"] {
   return { status: "pending", passed: null, failed: null, command: null, summary: null };
 }
 
-function emptyGit(baseBranch: string, repoPath: string | null): Task["git"] {
+function emptyGit(baseBranch: string, repoPath: string | null, explicit: boolean): Task["git"] {
   return {
     repoPath,
+    repoSource: repoPath ? "manual" : "none",
     branch: null,
     baseBranch,
+    baseBranchExplicit: explicit,
+    baseBranchWarning: null,
     headCommit: null,
     commitsCount: 0,
     changedFiles: 0,
@@ -110,6 +120,10 @@ function emptyGit(baseBranch: string, repoPath: string | null): Task["git"] {
     dirty: false,
     prUrl: null,
     prState: null,
+    remoteBranch: null,
+    upstream: null,
+    ahead: null,
+    behind: null,
   };
 }
 
@@ -141,7 +155,7 @@ export function createTask(input: CreateTaskInput, existingIds: string[], now: s
     qualityMode: quality,
     aiProvider: "grok-build",
     progress: 0,
-    git: emptyGit(input.baseBranch ?? "main", input.repoPath ?? null),
+    git: emptyGit(input.baseBranch?.trim() || "", input.repoPath ?? null, Boolean(input.baseBranch?.trim())),
     currentStage: "INBOX",
     nextAction: "Запустить обработку",
     goal: null,
@@ -152,6 +166,9 @@ export function createTask(input: CreateTaskInput, existingIds: string[], now: s
     reviewPassed: null,
     reviewSkipped: false,
     tests: emptyTests(),
+    testRuns: [],
+    testCommands: input.testCommands?.map((command) => command.trim()).filter(Boolean) ?? null,
+    reviewCounts: null,
     userApproved: false,
     fixCycles: 0,
     aiLabel: qualityLabel(quality),
@@ -251,6 +268,8 @@ export function applyFeedbackRestart(task: Task, now: string, note: string): Tas
     error: null,
     blockedReason: null,
     tests: emptyTests(),
+    testRuns: [],
+    reviewCounts: null,
     nextAction: "Исправление по замечанию",
   };
   if (next.status !== "BUILD") next = transition(next, "BUILD", now);
@@ -309,6 +328,34 @@ function remainingStages(task: Task): string[] {
   return stages;
 }
 
+export function etaRangeForStages(
+  stages: string[],
+  history: StageDuration[],
+): { min: number; max: number; uncertain: boolean } {
+  let min = 0;
+  let max = 0;
+  let uncertain = false;
+  for (const stage of stages) {
+    const samples = history.filter((item) => item.stage === stage && item.durationMs > 0);
+    if (samples.length >= 3) {
+      const sorted = samples.map((item) => item.durationMs).sort((a, b) => a - b);
+      const mid = sorted[Math.floor(sorted.length / 2)] ?? sorted[0] ?? 0;
+      const minutes = mid / 60000;
+      const stageMin = Math.max(1, Math.round(minutes * 0.8));
+      const stageMax = Math.max(stageMin, Math.round(minutes * 1.4));
+      min += stageMin;
+      max += stageMax;
+    } else {
+      uncertain = true;
+      const fallback = DEFAULT_STAGE_MINUTES[stage] ?? [5, 15];
+      min += fallback[0];
+      max += fallback[1];
+    }
+  }
+  if (max < min) max = min;
+  return { min, max, uncertain };
+}
+
 export function estimateEta(task: Task, history: StageDuration[]): EtaEstimate {
   if (task.status === "DONE") return { label: "Готово", uncertain: false, minMinutes: 0, maxMinutes: 0 };
   if (task.status === "CANCELLED") return { label: "Отменено", uncertain: false, minMinutes: null, maxMinutes: null };
@@ -319,39 +366,141 @@ export function estimateEta(task: Task, history: StageDuration[]): EtaEstimate {
     return { label: "Нужен ваш ответ", uncertain: false, minMinutes: null, maxMinutes: null };
   }
   const stages = remainingStages(task).filter((stage) => stage !== "USER_QA");
-  let min = 0;
-  let max = 0;
-  let uncertain = false;
-  for (const stage of stages) {
-    const samples = history.filter((item) => item.stage === stage && item.durationMs > 0);
-    if (samples.length >= 3) {
-      const sorted = samples.map((item) => item.durationMs).sort((a, b) => a - b);
-      const mid = sorted[Math.floor(sorted.length / 2)] ?? sorted[0] ?? 0;
-      const minutes = mid / 60000;
-      min += Math.max(1, Math.round(minutes * 0.8));
-      max += Math.max(min, Math.round(minutes * 1.4));
-    } else {
-      uncertain = true;
-      const fallback = DEFAULT_STAGE_MINUTES[stage] ?? [5, 15];
-      min += fallback[0];
-      max += fallback[1];
-    }
-  }
-  if (max < min) max = min;
+  const range = etaRangeForStages(stages, history);
+  const min = range.min;
+  const max = range.max;
+  const uncertain = range.uncertain;
   if (min === 0 && max === 0) return { label: "Почти готово", uncertain, minMinutes: 0, maxMinutes: 0 };
-  const range = min === max ? `≈ ${min} мин` : `≈ ${min}–${max} мин`;
+  const label = min === max ? `≈ ${min} мин` : `≈ ${min}–${max} мин`;
   return {
-    label: uncertain ? `Оценка пока неточная · ${range}` : range,
+    label: uncertain ? `Оценка пока неточная · ${label}` : label,
     uncertain,
     minMinutes: min,
     maxMinutes: max,
   };
 }
 
-export function inactivityLabel(updatedAt: string, now: string): string | null {
+export function inactivityDays(updatedAt: string, now: string): number {
   const days = Math.floor((Date.parse(now) - Date.parse(updatedAt)) / 86_400_000);
-  if (!Number.isFinite(days) || days < 7) return null;
+  return Number.isFinite(days) ? Math.max(0, days) : 0;
+}
+
+export function inactivityLevel(updatedAt: string, now: string): InactivityLevel {
+  const days = inactivityDays(updatedAt, now);
+  if (days >= 14) return "cold";
+  if (days >= 7) return "stale";
+  return "ok";
+}
+
+export function inactivityLabel(updatedAt: string, now: string): string | null {
+  const days = inactivityDays(updatedAt, now);
+  if (days < 7) return null;
   return `Нет активности ${days} дн.`;
+}
+
+const REVIEWABLE = new Set<TaskStatus>(["INBOX", "SPEC", "PLAN", "BUILD", "REVIEW", "TEST", "BLOCKED"]);
+
+export function getAvailableActions(task: Task, running: boolean): TaskActions {
+  const done = task.status === "DONE" || task.status === "CANCELLED";
+  const paused = task.status === "PAUSED";
+  const feedbackStatuses: TaskStatus[] = ["USER_QA", "TEST", "REVIEW", "READY", "BUILD"];
+  const branch = task.git.branch ?? "";
+  const none: TaskActions = {
+    canRun: false,
+    canReview: false,
+    canPause: false,
+    canResume: false,
+    canApprove: false,
+    canComplete: false,
+    canFeedback: false,
+    canCancel: false,
+    canPush: false,
+  };
+  if (task.status === "DONE") return none;
+  return {
+    canRun: !running && !done && !paused && task.status !== "READY" && task.status !== "USER_QA",
+    canReview: !running && REVIEWABLE.has(task.status),
+    canPause: !done && !paused,
+    canResume: paused && !running,
+    canApprove: !running && task.status === "USER_QA",
+    canComplete: !running && task.status === "READY" && task.userApproved,
+    canFeedback: !running && !done && feedbackStatuses.includes(task.status),
+    canCancel: !done,
+    canPush: !running && !done && task.requiresCode && branch.startsWith("task/"),
+  };
+}
+
+export function applyBuildReport(task: Task, report: BuildReport | null, now: string): Task {
+  if (!report) return { ...task, buildComplete: false };
+  const updates = new Map(report.steps.map((step) => [step.id, step]));
+  const plan = task.plan.map((step) => {
+    const update = updates.get(step.id);
+    if (!update) return step;
+    if (update.status === "done") {
+      return {
+        ...step,
+        status: "done" as const,
+        startedAt: step.startedAt ?? now,
+        finishedAt: now,
+        durationMs: step.durationMs ?? 0,
+      };
+    }
+    if (update.status === "failed") return { ...step, status: "failed" as const, finishedAt: now };
+    if (update.status === "skipped") return { ...step, status: "skipped" as const, finishedAt: now };
+    if (update.status === "pending") return { ...step, status: "pending" as const, finishedAt: null };
+    return step;
+  });
+  const required = plan.filter((step) => step.status !== "skipped");
+  const buildComplete = required.every((step) => step.status === "done");
+  return { ...task, plan, buildComplete };
+}
+
+export function reviewCountsFrom(findings: { severity: string }[]): ReviewCounts {
+  return {
+    high: findings.filter((item) => item.severity === "high").length,
+    medium: findings.filter((item) => item.severity === "medium").length,
+    low: findings.filter((item) => item.severity === "low").length,
+  };
+}
+
+export function resolveBoundRepo(
+  task: Task,
+  project: Project | null,
+  workspaceRoot: string,
+): { repoPath: string | null; source: RepoSource } {
+  if (task.git.repoSource === "manual" && task.git.repoPath) {
+    return { repoPath: resolveRepoPath(workspaceRoot, task.git.repoPath), source: "manual" };
+  }
+  const localPath = project?.repository?.localPath?.trim();
+  if (localPath) return { repoPath: resolveRepoPath(workspaceRoot, localPath), source: "project" };
+  if (task.git.repoPath && task.git.repoSource !== "none") {
+    return { repoPath: resolveRepoPath(workspaceRoot, task.git.repoPath), source: task.git.repoSource };
+  }
+  return { repoPath: null, source: "none" };
+}
+
+export function resolveRepoPath(workspaceRoot: string, value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return path.resolve(workspaceRoot);
+  return path.resolve(workspaceRoot, trimmed);
+}
+
+export function resolveTestCommands(task: Task, project: Project | null): string[] {
+  const own = (task.testCommands ?? []).map((command) => command.trim()).filter(Boolean);
+  if (own.length > 0) return own;
+  const fromProject = (project?.repository?.testCommands ?? []).map((command) => command.trim()).filter(Boolean);
+  if (fromProject.length > 0) return fromProject;
+  const legacy = project?.repository?.testCommand?.trim();
+  return legacy ? [legacy] : [];
+}
+
+export function pathInside(root: string, target: string): string | null {
+  const base = path.resolve(root);
+  const abs = path.resolve(base, target);
+  const rel = path.relative(base, abs);
+  if (rel === "") return abs;
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return abs;
 }
 
 export function isSecretPath(file: string): boolean {

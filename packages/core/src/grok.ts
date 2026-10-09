@@ -1,7 +1,7 @@
-import type { FeedbackAnalysis, PlanStep, ReviewDocument, SpecDocument, TaskType } from "./types.js";
+import type { BuildReport, FeedbackAnalysis, PlanStep, ReviewDocument, SpecDocument, TaskType } from "./types.js";
 import { ParseError } from "./types.js";
 
-export type GrokRole = "spec" | "plan" | "build" | "review" | "feedback" | "compose";
+export type GrokRole = "spec" | "plan" | "build" | "review" | "feedback" | "compose" | "report";
 
 const TASK_TYPES = new Set<TaskType>([
   "development",
@@ -90,6 +90,40 @@ export const FEEDBACK_SCHEMA = {
   required: ["understood", "changes", "requiresCode"],
 } as const;
 
+export const BUILD_REPORT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    summary: { type: "string" },
+    steps: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "string" },
+          status: { type: "string" },
+          note: { type: "string" },
+        },
+        required: ["id", "status"],
+      },
+    },
+    artifacts: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          path: { type: "string" },
+          label: { type: "string" },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  required: ["summary", "steps"],
+} as const;
+
 export const COMPOSE_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -105,6 +139,7 @@ const SCHEMA_BY_ROLE: Partial<Record<GrokRole, unknown>> = {
   review: REVIEW_SCHEMA,
   feedback: FEEDBACK_SCHEMA,
   compose: COMPOSE_SCHEMA,
+  report: BUILD_REPORT_SCHEMA,
 };
 
 const BUILD_DENIES = [
@@ -167,10 +202,11 @@ export interface ParsedGrokLine {
   error: string | null;
   done: boolean;
   sessionId: string | null;
+  command: string | null;
 }
 
 export function parseGrokStreamLine(line: string): ParsedGrokLine {
-  const empty: ParsedGrokLine = { timeline: null, textDelta: null, error: null, done: false, sessionId: null };
+  const empty: ParsedGrokLine = { timeline: null, textDelta: null, error: null, done: false, sessionId: null, command: null };
   const trimmed = line.trim();
   if (!trimmed.startsWith("{")) return empty;
   let event: Record<string, unknown>;
@@ -192,7 +228,9 @@ export function parseGrokStreamLine(line: string): ParsedGrokLine {
       sessionId: typeof event.sessionId === "string" ? event.sessionId : null,
     };
   }
-  if (type === "tool_call" || type === "tool_call_update") return { ...empty, timeline: toolTimeline(event) };
+  if (type === "tool_call" || type === "tool_call_update") {
+    return { ...empty, timeline: toolTimeline(event), command: toolCommand(event) };
+  }
   return empty;
 }
 
@@ -214,6 +252,15 @@ function toolTimeline(event: Record<string, unknown>): string | null {
     return `Команда: ${command}`;
   }
   return null;
+}
+
+function toolCommand(event: Record<string, unknown>): string | null {
+  const name = String(event.toolName ?? event.title ?? "");
+  const kind = String(event.kind ?? "");
+  const shell = name === "run_terminal_cmd" || name === "run_terminal_command" || name === "bash" || kind === "execute";
+  if (!shell || event.type !== "tool_call") return null;
+  const raw = (event.rawInput ?? {}) as Record<string, unknown>;
+  return typeof raw.command === "string" ? raw.command : null;
 }
 
 function basename(file: string): string {
@@ -384,6 +431,30 @@ export function coerceFeedback(value: unknown): FeedbackAnalysis {
     understood,
     changes: stringList(record.changes),
     requiresCode: record.requiresCode === true,
+  };
+}
+
+export function coerceBuildReport(value: unknown): BuildReport {
+  const record = asRecord(value, "отчёт сборки");
+  const summary = optionalString(record.summary) ?? "Сборка завершена";
+  const steps = Array.isArray(record.steps) ? record.steps : [];
+  const artifacts = Array.isArray(record.artifacts) ? record.artifacts : [];
+  return {
+    summary,
+    steps: steps.flatMap((item) => {
+      const step = asRecord(item, "шаг отчёта");
+      const id = optionalString(step.id);
+      if (!id) return [];
+      const allowed = ["done", "pending", "failed", "skipped"] as const;
+      const status = allowed.find((item) => item === step.status) ?? "pending";
+      return [{ id, status, note: optionalString(step.note) ?? "" }];
+    }),
+    artifacts: artifacts.flatMap((item) => {
+      const artifact = asRecord(item, "артефакт");
+      const artifactPath = optionalString(artifact.path);
+      if (!artifactPath) return [];
+      return [{ path: artifactPath, label: optionalString(artifact.label) ?? artifactPath }];
+    }),
   };
 }
 
