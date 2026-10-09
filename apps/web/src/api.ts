@@ -20,6 +20,20 @@ export interface TaskCard {
   error: { code: string; message: string; details?: string } | null;
   updatedAt: string;
   currentStage: string;
+  reviewLabel: string | null;
+  actions: TaskActions;
+}
+
+export interface TaskActions {
+  canRun: boolean;
+  canReview: boolean;
+  canPause: boolean;
+  canResume: boolean;
+  canApprove: boolean;
+  canComplete: boolean;
+  canFeedback: boolean;
+  canCancel: boolean;
+  canPush: boolean;
 }
 
 export interface PlanStep {
@@ -49,8 +63,10 @@ export interface TaskDetail extends TaskCard {
   assumptions: string[];
   git: {
     repoPath: string | null;
+    repoSource: "project" | "manual" | "none";
     branch: string | null;
     baseBranch: string;
+    baseBranchWarning: string | null;
     headCommit: string | null;
     commitsCount: number;
     changedFiles: number;
@@ -59,10 +75,17 @@ export interface TaskDetail extends TaskCard {
     dirty: boolean;
     prUrl: string | null;
     prState: string | null;
+    remoteBranch: string | null;
+    upstream: string | null;
+    ahead: number | null;
+    behind: number | null;
   };
   fixCycles: number;
   requiresCodeMode: string;
   createdAt: string;
+  reviewCounts: { high: number; medium: number; low: number } | null;
+  testRuns: { id: string; command: string; status: string; exitCode: number | null; passed: number | null; failed: number | null; summary: string }[];
+  artifacts: { id: string; name: string; path: string; sizeBytes: number | null; source: string; missing: boolean }[];
 }
 
 export interface Project {
@@ -77,14 +100,41 @@ export interface Project {
   createdAt: string;
   updatedAt: string;
   inactivity: string | null;
+  inactivityLevel: "ok" | "stale" | "cold";
+  activeTasks: number;
+  waitingQa: number;
+  doneTasks: number;
+  repository: {
+    localPath: string;
+    remoteUrl: string | null;
+    baseBranch: string | null;
+    testCommand: string | null;
+    testCommands: string[];
+  } | null;
+}
+
+export interface SyncSnapshot {
+  state: "synced" | "local" | "remote" | "conflict" | "offline";
+  branch: string | null;
+  ahead: number | null;
+  behind: number | null;
+  dirty: boolean;
+  message: string;
 }
 
 export interface Health {
   ok: boolean;
   runtime: string;
   grok: boolean;
+  grokCompatible: boolean | null;
+  grokVersion: string | null;
+  grokMessage: string | null;
   git: boolean;
+  nodeVersion: string;
   model: string;
+  repo: { path: string; branch: string | null };
+  sync: { state: string; ahead: number | null; behind: number | null; message: string };
+  storage: boolean;
 }
 
 export class ApiError extends Error {

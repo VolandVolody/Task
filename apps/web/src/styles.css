@@ -207,6 +207,14 @@ textarea { min-height: 140px; resize: vertical; }
 
 .project { margin-bottom: 12px; }
 .project p { color: var(--muted); }
+.project.cold { border-color: var(--coral); box-shadow: inset 3px 0 0 var(--coral); }
+.chip.stale { color: var(--amber-2); }
+.chip.cold { color: var(--coral); }
+.search { min-width: 220px; flex: 1; border: 1px solid var(--line); background: #10130d; border-radius: 999px; padding: 10px 14px; }
+.system { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; color: var(--muted); font-size: 13px; margin: 8px 0 16px; }
+.review-flag { color: var(--coral); }
+.repo-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+.repo-form input { border: 1px solid var(--line); background: #10130d; border-radius: 12px; padding: 8px 10px; }
 
 @media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }

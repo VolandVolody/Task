@@ -50,7 +50,9 @@ export function DetailView({
   onReview,
   onApprove,
   onComplete,
+  onPush,
   onFeedback,
+  onArtifact,
 }: {
   task: TaskDetail;
   log: string;
@@ -63,14 +65,16 @@ export function DetailView({
   onReview: () => void;
   onApprove: () => void;
   onComplete: () => void;
+  onPush: () => void;
   onFeedback: (text: string) => void;
+  onArtifact: (id: string, mode: "open" | "reveal") => void;
 }) {
   const [note, setNote] = useState("");
   const [raw, setRaw] = useState(false);
   const [showError, setShowError] = useState(false);
   const noteRef = useRef<HTMLTextAreaElement>(null);
-  const canFeedback = ["USER_QA", "TEST", "REVIEW", "READY", "BLOCKED", "BUILD"].includes(task.status);
-  const closed = task.status === "DONE" || task.status === "CANCELLED";
+  const canFeedback = task.actions.canFeedback || task.status === "BLOCKED";
+  const source = task.git.repoSource === "project" ? "Проект" : task.git.repoSource === "manual" ? "Вручную" : "нет";
 
   return (
     <>
@@ -91,6 +95,7 @@ export function DetailView({
           <button className="ghost" onClick={onClose}>Закрыть</button>
         </div>
         <p className="hint">{task.etaLabel}</p>
+        {task.reviewLabel && <p className="review-flag">{task.reviewLabel}</p>}
         {task.nextAction && <p>Дальше: {task.nextAction}</p>}
         {task.error && (
           <div className="error-card">
@@ -100,12 +105,14 @@ export function DetailView({
           </div>
         )}
         <div className="actions">
-          {task.status === "PAUSED" ? <button className="ghost" onClick={onResume}>Продолжить</button> : !closed && <button className="ghost" onClick={onPause}>Пауза</button>}
-          {!closed && task.status !== "PAUSED" && <button className="primary" onClick={onRun} disabled={task.running}>{task.running ? "Выполняется…" : "Запустить"}</button>}
-          {!closed && task.status !== "PAUSED" && <button className="ghost" onClick={onReview} disabled={task.running}>На ревью</button>}
-          {task.status === "USER_QA" && <button className="ghost" onClick={() => noteRef.current?.focus()}>Проверить результат</button>}
-          {task.status === "USER_QA" && <button className="primary" onClick={onApprove}>Подтвердить</button>}
-          {task.status === "READY" && <button className="primary" onClick={onComplete}>Закрыть задачу</button>}
+          {task.actions.canResume && <button className="ghost" onClick={onResume}>Продолжить</button>}
+          {task.actions.canPause && <button className="ghost" onClick={onPause}>Пауза</button>}
+          {task.actions.canRun && <button className="primary" onClick={onRun} disabled={task.running}>{task.running ? "Выполняется…" : "Запустить"}</button>}
+          {task.actions.canReview && <button className="ghost" onClick={onReview} disabled={task.running}>На ревью</button>}
+          {task.actions.canApprove && <button className="ghost" onClick={() => noteRef.current?.focus()}>Проверить результат</button>}
+          {task.actions.canApprove && <button className="primary" onClick={onApprove}>Подтвердить</button>}
+          {task.actions.canComplete && <button className="primary" onClick={onComplete}>Закрыть задачу</button>}
+          {task.actions.canPush && <button className="ghost" onClick={onPush}>Отправить ветку</button>}
         </div>
         <div className="tabs" role="tablist">
           {TABS.map(([id, label]) => (
@@ -168,7 +175,13 @@ export function DetailView({
         {tab === "git" && (
           <div className="meta" style={{ display: "grid", gap: 8 }}>
             <div>Репозиторий: {task.git.repoPath || "не выбран"}</div>
+            <div>Источник: {source}</div>
+            <div>Базовая ветка: {task.git.baseBranch || "определится при запуске"}</div>
+            {task.git.baseBranchWarning && <div>{task.git.baseBranchWarning}</div>}
+            <div>Команда тестов: {task.tests.command || "не задана"}</div>
             <div>Ветка: {task.git.branch || "нет"}</div>
+            <div>Upstream: {task.git.upstream || "нет"}</div>
+            <div>Ahead: {task.git.ahead ?? "—"} · Behind: {task.git.behind ?? "—"}</div>
             <div>Коммит: {task.git.headCommit || "нет"}</div>
             <div>Коммитов от {task.git.baseBranch}: {task.git.commitsCount}</div>
             <div>Изменённых файлов: {task.git.changedFiles}</div>
@@ -183,19 +196,42 @@ export function DetailView({
             <p>Статус: {task.tests.status}</p>
             <p>Команда: {task.tests.command || "не задана"}</p>
             <p>{task.tests.passed ?? "—"} passed / {task.tests.failed ?? "—"} failed</p>
+            {task.testRuns.map((run) => (
+              <p key={run.id}>{run.command} · exit {run.exitCode ?? "?"} · {run.status}</p>
+            ))}
             {task.tests.summary && <pre className="log">{task.tests.summary}</pre>}
           </div>
         )}
         {tab === "files" && (
           <div>
+            <h3>Документы задачи</h3>
             <ul>
               {task.documents.spec && <li>spec.md</li>}
               {task.documents.plan && <li>plan.md</li>}
               {task.documents.review && <li>review.md</li>}
               {task.documents.result && <li>result.md</li>}
               {task.feedback.map((item) => <li key={item.id}>feedback/{item.id}.md — {item.body}</li>)}
+              {!task.documents.spec && !task.documents.result && task.feedback.length === 0 && <li>Документов пока нет.</li>}
+            </ul>
+            <h3>Сгенерированные артефакты</h3>
+            <ul>
+              {task.artifacts.length === 0 && <li>Артефактов пока нет.</li>}
+              {task.artifacts.map((artifact) => (
+                <li key={artifact.id}>
+                  {artifact.name} · {artifact.path} · {artifact.missing ? "файл не найден" : `${artifact.sizeBytes ?? 0} байт`}
+                  {!artifact.missing && (
+                    <span className="actions">
+                      <button type="button" className="textish" onClick={() => onArtifact(artifact.id, "open")}>Открыть</button>
+                      <button type="button" className="textish" onClick={() => onArtifact(artifact.id, "reveal")}>Показать в папке</button>
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <h3>Изменённые исходники</h3>
+            <ul>
+              {task.git.changedFileNames.length === 0 && <li>Нет.</li>}
               {task.git.changedFileNames.map((file) => <li key={file}>{file}</li>)}
-              {!task.documents.spec && !task.documents.result && task.git.changedFileNames.length === 0 && task.feedback.length === 0 && <li>Артефактов пока нет.</li>}
             </ul>
             {task.documents.result && <Doc text={task.documents.result} empty="" />}
           </div>

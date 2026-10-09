@@ -5,5 +5,12 @@
   "baseBranch": "main",
   "defaultRepoPath": ".",
   "testCommand": "npm test",
-  "grokTimeoutMs": 900000
+  "grokTimeoutMs": 900000,
+  "aiRouting": {
+    "spec": "grok-build",
+    "plan": "grok-build",
+    "builder": "grok-build",
+    "reviewer": "grok-build",
+    "feedback": "grok-build"
+  }
 }
